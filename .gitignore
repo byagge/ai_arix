@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+venv/
+.env
+.history/
+uploads/
+sessions/
+*.session
+node_modules/
+.next/
+dist/
+*.log
+.DS_Store
