@@ -27,16 +27,35 @@ async def mark_read(
     chat_id: int,
     message_id: int,
     business_connection_id: str | None = None,
-) -> None:
+) -> bool:
+    """Mark message as read (blue ticks). Only available for Telegram Business.
+
+    Requires business bot right ``can_read_messages``. Regular private bot chats
+    have no Bot API for read receipts — typing works, double-check does not.
+    """
+    if not business_connection_id:
+        return False
     try:
-        if business_connection_id:
-            await bot.read_business_message(
-                business_connection_id=business_connection_id,
-                chat_id=chat_id,
-                message_id=message_id,
-            )
+        await bot.read_business_message(
+            business_connection_id=business_connection_id,
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+        return True
+    except BadRequest as e:
+        # Typical: missing can_read_messages, inactive chat, bad message_id
+        logger.warning(
+            "read receipt failed chat=%s msg=%s bc=%s: %s "
+            "(enable «Read messages» for the business bot in Telegram Settings → Business → Chatbots)",
+            chat_id,
+            message_id,
+            business_connection_id,
+            e,
+        )
+        return False
     except Exception as e:
-        logger.debug("read receipt: %s", e)
+        logger.warning("read receipt failed chat=%s msg=%s: %s", chat_id, message_id, e)
+        return False
 
 
 async def typing_loop(
@@ -101,9 +120,11 @@ async def deliver_reply(
         "chat_id": chat_id,
         "text": text,
         "business_connection_id": business_connection_id,
-        "reply_to_message_id": reply_to_message_id,
         "disable_web_page_preview": True,
     }
+    # Only quote when explicitly requested (client replied to something)
+    if reply_to_message_id is not None:
+        kwargs["reply_to_message_id"] = reply_to_message_id
     if looks_like_html(text):
         kwargs["parse_mode"] = ParseMode.HTML
 

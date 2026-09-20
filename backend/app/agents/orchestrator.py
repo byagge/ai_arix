@@ -44,8 +44,10 @@ async def analyze_dialog(
 - estimated_days: ориентир дней (обычно 5-8)
 
 Поле is_side_question:
-- true если сообщение НЕ про текущую задачу (гарант, посторонний вопрос, small talk без продолжения тз)
-- false если клиент дополняет тз, уточняет задачу, модель, функции, сроки по проекту"""
+- true если сообщение НЕ про дополнение ТЗ: гарант, small talk, «как проходит сделка», «что дальше», «как оплата», уточнение процесса
+- true также если в истории уже есть цена менеджера, а клиент спрашивает процесс/сроки/гарант без нового ТЗ
+- false если клиент дополняет тз, уточняет задачу, модель, функции, объём по проекту
+- если is_side_question=true → requirements_complete=false, admin_task_summary=null, client_offer_pitch=null"""
     try:
         data = await generate_json(prompt, system)
         data.setdefault("requirements_complete", False)
@@ -85,6 +87,35 @@ async def analyze_dialog(
             data["target_agent"] = "payment"
             data["ready_for_payment"] = True
             data["intent"] = "payment"
+
+        # Hard overrides from message shape — never miss a long TZ
+        from app.services.message_intel import (
+            MsgKind,
+            classify_message,
+            client_body,
+            has_task_substance,
+        )
+
+        kind = classify_message(user_message)
+        substance = has_task_substance(user_message)
+        body = client_body(user_message)
+        if substance:
+            data["target_agent"] = data.get("target_agent") or "sales"
+            if data.get("target_agent") == "none":
+                data["target_agent"] = "sales"
+            data["is_side_question"] = False
+            data["should_respond"] = True
+        if kind == MsgKind.LONG_TZ and len(body) >= 120:
+            data["requirements_complete"] = True
+            data["is_side_question"] = False
+            if not data.get("admin_task_summary"):
+                data["admin_task_summary"] = body[:1500]
+        if kind == MsgKind.SHORT_POINTER and substance:
+            data["requirements_complete"] = True
+            data["is_side_question"] = False
+            if not data.get("admin_task_summary"):
+                data["admin_task_summary"] = body[:1500] if len(body) > 40 else user_message[:1500]
+
         return data
     except Exception:
         lower = user_message.lower()
@@ -127,7 +158,13 @@ async def analyze_dialog(
                 "estimated_days": None,
                 "is_side_question": False,
             }
-        side = any(w in lower for w in ("гарант", "escrow", "привет", "здравств", "hello", "hi"))
+        # Bare greeting only = side; long «Привет, … + задача» is NOT side
+        from app.services.message_intel import has_task_substance
+
+        greeting_bits = any(w in lower for w in ("привет", "здравств", "hello", "hi", "ку", "хай"))
+        escrow_bits = any(w in lower for w in ("гарант", "escrow"))
+        substance = has_task_substance(user_message)
+        side = (escrow_bits or (greeting_bits and not substance)) and not substance
         return {
             "funnel_stage": funnel_stage,
             "intent": "consultation",
@@ -138,8 +175,8 @@ async def analyze_dialog(
             "ready_for_payment": False,
             "extracted_amount": None,
             "extracted_product": None,
-            "requirements_complete": False,
-            "admin_task_summary": None,
+            "requirements_complete": substance and len(user_message.strip()) >= 120,
+            "admin_task_summary": (user_message[:1500] if substance and len(user_message.strip()) >= 120 else None),
             "client_offer_pitch": None,
             "estimated_price_usd": None,
             "estimated_days": None,

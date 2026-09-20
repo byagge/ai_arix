@@ -23,12 +23,21 @@ def is_ready_to_pay(text: str) -> bool:
 
 
 def is_escrow_pay_intent(text: str) -> bool:
-    lower = (text or "").lower()
+    """True only when client chooses to PAY via guarantee — not «можно через гаранта?»"""
+    lower = (text or "").lower().strip()
+    # Pure FAQ / possibility questions are NOT pay intent
+    if re.search(r"(?i)(?:^можно\b|^есть\b|какой\s+гарант|\?)", lower) and not re.search(
+        r"(?i)(?:оплач|кину|кидаю|буду\s+через|давай\s+(?:через|опла)|готов|отправляю|беру)",
+        lower,
+    ):
+        return False
     return bool(
         re.search(
-            r"(?i)(?:через\s+гарант|через\s+эскроу|через\s+escrow|"
-            r"опла\w*\s+(?:через\s+)?гарант|кину\s+на\s+гарант|"
-            r"на\s+гаранта|давай\s+(?:через\s+)?гарант|буду\s+через\s+гарант)",
+            r"(?i)(?:опла\w*\s+(?:через\s+)?гарант|кину\s+на\s+гарант|"
+            r"давай\s+(?:через\s+)?гарант|буду\s+через\s+гарант|"
+            r"отправляю\s+(?:через\s+)?гарант|через\s+гарант\w*\s+(?:опла|кину|буду)|"
+            r"оплат\w*\s+через\s+(?:гарант|эскроу|escrow)|"
+            r"^(?:через\s+гарант\w*|на\s+гаранта)\s*[.!]*$)",
             lower,
         )
     )
@@ -52,6 +61,23 @@ def match_escrow_guarantee_question(text: str) -> str | None:
     return None
 
 
+def is_capability_question(text: str) -> bool:
+    """Short «делаете ботов?» / «можете парсер?» — not a full TZ."""
+    body = (text or "").strip()
+    if len(body) > 90:
+        return False
+    return bool(
+        re.search(
+            r"(?i)(?:^привет[,!]\s*)?(?:а\s+)?(?:вы\s+)?(?:делаете|делаешь|можете|можешь|есть\s+ли)\b",
+            body,
+        )
+    )
+
+
+def capability_reply() -> str:
+    return "да, делаем почти любой софт под задачу, напиши что нужно - сориентирую по цене и срокам"
+
+
 def is_price_request(text: str) -> bool:
     lower = (text or "").lower()
     return bool(
@@ -61,6 +87,35 @@ def is_price_request(text: str) -> bool:
             r"скинь\s+цен|цену\s+скаж|price)",
             lower,
         )
+    )
+
+
+def is_deal_process_question(text: str) -> bool:
+    """How deal / payment / next steps works — not a new TZ and not «how much?»."""
+    if is_price_request(text) or is_ready_to_pay(text) or is_escrow_pay_intent(text):
+        return False
+    lower = (text or "").lower().strip()
+    return bool(
+        re.search(
+            r"(?i)(?:как\s+проходит\s+сделк|как\s+ид[её]т\s+сделк|как\s+работаем|"
+            r"как\s+дальше|какие\s+этап|как\s+оплат|условия\s+сделк|"
+            r"схема\s+работ|порядок\s+работ|как\s+оформ|что\s+дальше|"
+            r"как\s+запуск|как\s+начинаем|процесс\s+сделк)",
+            lower,
+        )
+    )
+
+
+def deal_process_reply(*, has_quote: bool = False) -> str:
+    if has_quote:
+        return (
+            "по сделке просто: фиксируем тз и цену как уже написал, "
+            "оплата usdt или через гаранта, дальше делаем по срокам, "
+            "по готовности отдаём + дока, 30 дней правки"
+        )
+    return (
+        "по процессу: собираем тз, я даю цену и сроки, "
+        "оплата usdt или гарант, делаем, отдаём с докой + 30 дней поддержки"
     )
 
 

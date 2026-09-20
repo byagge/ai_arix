@@ -28,6 +28,8 @@ class QueuedMessage:
     is_business: bool
     media_type: str = "text"
     save_only: bool = False
+    # Quote the user message in Telegram only when they replied to something
+    use_reply: bool = False
 
 
 def _normalize_outcome(raw: ReplyOutcome | str | None) -> ReplyOutcome:
@@ -58,6 +60,20 @@ class ReplyQueue:
 
     async def _run(self, key: str, process: ProcessFn) -> None:
         try:
+            from app.telegram.client import get_application
+
+            app = get_application()
+            bot = app.bot
+
+            # Snapshot current buffer for early read (before think delay)
+            async with self._lock:
+                pending = list(self._buffers.get(key, []))
+            # Mark as read immediately — human opens chat, then thinks/types
+            for m in pending:
+                if m.save_only or not m.business_connection_id:
+                    continue
+                await mark_read(bot, m.chat_id, m.message_id, m.business_connection_id)
+
             delay = reply_delay_sec()
             await asyncio.sleep(delay)
             async with self._lock:
@@ -65,15 +81,19 @@ class ReplyQueue:
             if not batch:
                 return
 
-            from app.telegram.client import get_application
-
-            app = get_application()
-            bot = app.bot
             last = batch[-1]
+
+            # Messages that arrived during delay — mark those too
+            already = {m.message_id for m in pending}
+            for m in batch:
+                if m.message_id in already or m.save_only or not m.business_connection_id:
+                    continue
+                await mark_read(bot, m.chat_id, m.message_id, m.business_connection_id)
 
             combined = "\n".join(m.content for m in batch if m.content)
             # Use last message metadata; content may be burst for LLM context
             last_content = last.content
+            use_reply = any(m.use_reply for m in batch)
             merged = QueuedMessage(
                 chat_id=last.chat_id,
                 user_id=last.user_id,
@@ -85,6 +105,7 @@ class ReplyQueue:
                 is_business=last.is_business,
                 media_type=last.media_type,
                 save_only=any(m.save_only for m in batch),
+                use_reply=use_reply,
             )
 
             outcome = _normalize_outcome(await process([merged]))
@@ -92,17 +113,16 @@ class ReplyQueue:
             if last.save_only or not outcome.should_send():
                 return
 
-            if outcome.mark_read:
-                for m in batch:
-                    await mark_read(bot, m.chat_id, m.message_id, m.business_connection_id)
-
-            # Typing only when we actually send (deliver_reply also types)
+            # Plain send by default; quote only when client replied or outcome asks
+            should_quote = (
+                outcome.use_reply if outcome.use_reply is not None else use_reply
+            )
             await deliver_reply(
                 bot,
                 last.chat_id,
                 outcome.text or "",
                 business_connection_id=last.business_connection_id,
-                reply_to_message_id=last.message_id,
+                reply_to_message_id=last.message_id if should_quote else None,
             )
         except asyncio.CancelledError:
             pass

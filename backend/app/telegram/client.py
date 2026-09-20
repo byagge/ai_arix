@@ -84,6 +84,13 @@ async def _upsert_business_connection(bc) -> BusinessConnection | None:
         )
         row = result.scalar_one_or_none()
         can_reply = bool(getattr(bc, "can_reply", True))
+        rights = getattr(bc, "rights", None)
+        can_read = True
+        if rights is not None:
+            can_read = bool(getattr(rights, "can_read_messages", False))
+            # Newer API: can_reply may live only under rights
+            if hasattr(rights, "can_reply"):
+                can_reply = bool(rights.can_reply)
         payload = {
             "user": {
                 "id": bc.user.id,
@@ -92,8 +99,16 @@ async def _upsert_business_connection(bc) -> BusinessConnection | None:
             },
             "is_enabled": bc.is_enabled,
             "can_reply": can_reply,
+            "can_read_messages": can_read,
             "user_chat_id": getattr(bc, "user_chat_id", None),
         }
+        if not can_read:
+            logger.warning(
+                "Business connection %s: can_read_messages=False — "
+                "client will not see blue double-check. Enable «Read messages» "
+                "in Telegram → Settings → Business → Chatbots",
+                bc.id,
+            )
         if row:
             row.is_enabled = bc.is_enabled
             row.can_reply = can_reply
@@ -189,6 +204,7 @@ async def _enqueue_message(
     content: str,
     media_type: str = "text",
     save_only: bool = False,
+    use_reply: bool = False,
 ) -> None:
     if not message or not user:
         return
@@ -223,16 +239,55 @@ async def _enqueue_message(
         is_business=is_business,
         media_type=media_type,
         save_only=save_only,
+        use_reply=use_reply,
     )
     logger.info(
-        "enqueue tg user=%s chat=%s biz=%s save_only=%s text=%r",
+        "enqueue tg user=%s chat=%s biz=%s save_only=%s reply=%s text=%r",
         user.id,
         message.chat_id,
         bool(bc_id),
         save_only,
+        use_reply,
         (content or "")[:80],
     )
     await reply_queue.enqueue(qm, _process_batch)
+
+
+def _extract_reply_to_text(message) -> str | None:
+    """Text/caption (or sticker label) of the message the client replied to."""
+    reply = getattr(message, "reply_to_message", None)
+    if not reply:
+        return None
+    quoted = (reply.text or reply.caption or "").strip()
+    if quoted:
+        return quoted[:4000]
+    if getattr(reply, "sticker", None):
+        emoji = getattr(reply.sticker, "emoji", None) or ""
+        return f"[стикер] {emoji}".strip() or "[стикер]"
+    if getattr(reply, "photo", None):
+        return "[фото]" + (f" {reply.caption}" if reply.caption else "")
+    if getattr(reply, "document", None):
+        name = getattr(reply.document, "file_name", None) or "файл"
+        return f"[документ {name}]"
+    if getattr(reply, "voice", None) or getattr(reply, "audio", None):
+        return "[голосовое]"
+    return None
+
+
+def _enrich_content_with_reply(content: str, message) -> tuple[str, bool]:
+    """
+    If client replied to a prior message, prepend quoted context for LLM/history.
+    Returns (enriched_content, use_reply_flag).
+    """
+    quoted = _extract_reply_to_text(message)
+    if not quoted:
+        return content, False
+    body = (content or "").strip()
+    enriched = (
+        f"[клиент отвечает на сообщение]:\n{quoted}\n\n"
+        f"[его ответ]:\n{body}"
+    )
+    return enriched, True
 
 
 async def _handle_incoming(
@@ -258,6 +313,9 @@ async def _handle_incoming(
         logger.info("skip empty message chat=%s", getattr(message, "chat_id", None))
         return
 
+    # Keep reply-quote context for LLM + DB history (short «тз вот» etc.)
+    content, use_reply = _enrich_content_with_reply(content, message)
+
     await _enqueue_message(
         message,
         user,
@@ -265,6 +323,7 @@ async def _handle_incoming(
         content=content,
         media_type=media_type,
         save_only=save_only,
+        use_reply=use_reply,
     )
 
 
@@ -371,8 +430,19 @@ async def on_business_connection(update: Update, context: ContextTypes.DEFAULT_T
         return
     await _upsert_business_connection(bc)
     status = "подключён" if bc.is_enabled else "отключён"
+    rights = getattr(bc, "rights", None)
     can_reply = bool(getattr(bc, "can_reply", True))
-    logger.info("Business connection %s: %s can_reply=%s owner=%s", bc.id, status, can_reply, bc.user.id)
+    can_read = bool(getattr(rights, "can_read_messages", False)) if rights else True
+    if rights is not None and hasattr(rights, "can_reply"):
+        can_reply = bool(rights.can_reply)
+    logger.info(
+        "Business connection %s: %s can_reply=%s can_read=%s owner=%s",
+        bc.id,
+        status,
+        can_reply,
+        can_read,
+        bc.user.id,
+    )
     print(f"Business Bot {status}: {bc.id} can_reply={can_reply} owner={bc.user.id}")
     try:
         await send_admin_notification(
@@ -422,6 +492,7 @@ def register_handlers(app: Application) -> None:
         | filters.VIDEO_NOTE
         | filters.TEXT
         | filters.CAPTION
+        | filters.Sticker.ALL
     )
 
     app.add_handler(

@@ -47,7 +47,10 @@ def should_suppress_followup(dialog: Dialog) -> bool:
         WorkStatus.PAYMENT_PENDING.value,
         WorkStatus.PAID.value,
         WorkStatus.IN_PROGRESS.value,
+        WorkStatus.AWAITING_ADMIN.value,
     ):
+        return True
+    if getattr(dialog, "awaiting_admin_quote", False):
         return True
     if dialog.followup_mode == FollowupMode.NONE.value:
         return True
@@ -104,18 +107,26 @@ def next_followup_at(now: datetime, followup_count: int, delays_hours: list[int]
 
 
 FOLLOWUP_TEMPLATES = [
-    "Привет, нужно будет?",
-    "Здравствуйте, актуально?",
-    "Добрый день, как вы?",
-    "Привет, готовы сделать в лучшем виде, если ещё нужно",
-    "Здравствуйте, на связи если вопрос остался",
+    "привет, нужно будет?",
+    "здравствуйте, актуально?",
+    "добрый день, как вы?",
+    "привет, готовы сделать если ещё нужно",
+    "здравствуйте, на связи если вопрос остался",
 ]
 
-PAYMENT_REMINDER = "Начинаем?"
+FOLLOWUP_WITH_TZ = [
+    "по задаче ещё актуально?",
+    "оценка на связи, продолжаем?",
+    "по тз ещё нужно или пауза?",
+]
+
+PAYMENT_REMINDER = "начинаем?"
 
 
 def pick_followup_message(dialog: Dialog, *, payment_reminder: bool = False) -> str:
     import random
     if payment_reminder:
         return PAYMENT_REMINDER
+    if (getattr(dialog, "tz_summary", None) or getattr(dialog, "admin_task_summary", None) or "").strip():
+        return random.choice(FOLLOWUP_WITH_TZ)
     return random.choice(FOLLOWUP_TEMPLATES)

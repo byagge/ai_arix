@@ -187,13 +187,13 @@ async def _anthropic(prompt: str, system: str | None, temperature: float) -> str
 
 def _heuristic_reply(prompt: str, system: str | None) -> str:
     """Last-resort reply when all LLMs fail. Uses ONLY the client line, not system prompt."""
-    # Prefer last "Клиент:" line so system instructions (гарант/цены) don't leak into matching
-    user_bits = re.findall(r"Клиент:\s*(.+)", prompt or "", flags=re.I)
+    # Prefer last "Клиент:" block (may be multiline after enrichment)
+    user_bits = re.findall(r"Клиент:\s*((?:.|\n)+?)(?=\n(?:Менеджер|Оператор|Клиент):|\Z)", prompt or "", flags=re.I)
     focus = (user_bits[-1] if user_bits else "").strip()
     if not focus:
-        # Fallback: last non-empty short paragraph
         parts = [p.strip() for p in (prompt or "").split("\n") if p.strip()]
-        focus = parts[-1][:300] if parts else ""
+        focus = parts[-1][:2000] if parts else ""
+    # If enrichment wrapper, use full focus (quoted TZ + answer)
     lower = focus.lower()
     sys_l = (system or "").lower()
 
@@ -209,8 +209,27 @@ def _heuristic_reply(prompt: str, system: str | None) -> str:
                 "ready_for_payment": False,
                 "extracted_amount": None,
                 "extracted_product": None,
+                "requirements_complete": False,
+                "admin_task_summary": None,
+                "client_offer_pitch": None,
+                "estimated_price_usd": None,
+                "estimated_days": None,
+                "is_side_question": False,
             },
             ensure_ascii=False,
+        )
+
+    from app.services.message_intel import (
+        has_reply_context,
+        has_task_substance,
+        ideal_tz_ack,
+        is_short_pointer,
+    )
+
+    if has_task_substance(focus) or has_reply_context(focus) or is_short_pointer(focus):
+        return ideal_tz_ack(
+            pointer=is_short_pointer(focus) or has_reply_context(focus),
+            content=focus,
         )
 
     # Escrow only if CLIENT asked
@@ -236,9 +255,6 @@ def _heuristic_reply(prompt: str, system: str | None) -> str:
             "(по номеру, авто, соцсетям), админ-панелью и приемом платежей за пару дней"
         )
 
-    if any(w in lower for w in ("привет", "здравств", "hello", "hi", "ку", "хай")):
-        return "привет, слушаю"
-
     if any(
         w in lower
         for w in (
@@ -253,9 +269,15 @@ def _heuristic_reply(prompt: str, system: str | None) -> str:
             "телефон",
             "android",
             "имя",
+            "парсер",
+            "бот",
         )
     ):
         return "да, сделаем, напиши детали задачи и модель устройства если важно"
+
+    # Greeting ONLY when the whole focus is a short hello (task already handled above)
+    if len(focus) <= 40 and any(w in lower for w in ("привет", "здравств", "hello", "hi", "ку", "хай")):
+        return "привет, слушаю"
 
     return "напишите что нужно - сделаем под задачу"
 

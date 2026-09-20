@@ -10,6 +10,9 @@ GREETING_ONLY = re.compile(
     re.I,
 )
 
+# Entire message must be a short greeting — never match TZ that starts with «Привет, …»
+_GREETING_MAX_LEN = 40
+
 GREETING_REPLIES = [
     "привет",
     "здравствуйте",
@@ -36,7 +39,18 @@ _DEFER_PRICE = re.compile(
 
 
 def is_greeting_only(text: str) -> bool:
-    return bool(GREETING_ONLY.match(text.strip()))
+    """True only if the whole message is a short greeting (not «Привет,» + task)."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if len(t) > _GREETING_MAX_LEN:
+        return False
+    if "\n" in t:
+        # Multi-line with substance after greeting → sales pipeline
+        rest = t.split("\n", 1)[1].strip()
+        if len(rest) > 8:
+            return False
+    return bool(GREETING_ONLY.match(t))
 
 
 def greeting_reply() -> str:
@@ -44,9 +58,19 @@ def greeting_reply() -> str:
 
 
 STICKER_GREETING_REPLIES = [
-    "привет, чем могу помочь? делаем любой софт под задачу - боты, утилиты, веб, парсеры",
-    "здравствуйте, на связи, напишите что нужно сделать - софт, бот или утилиту под вашу задачу",
-    "привет, слушаю, что нужно разработать?",
+    "добрый день, чем могу помочь?",
+    "здравствуйте, чем могу помочь?",
+    "привет, чем могу помочь?",
+    "добрый день, на связи, напишите что нужно",
+    "привет, слушаю, что нужно сделать?",
+]
+
+STICKER_ACK_REPLIES = [
+    "ага, напишите текстом что нужно",
+    "ок, слушаю, опишите задачу",
+    "понял, чем помочь?",
+    "на связи, напишите что сделать",
+    "видел, пишите что нужно",
 ]
 
 
@@ -54,7 +78,12 @@ def sticker_greeting_reply() -> str:
     return random.choice(STICKER_GREETING_REPLIES)
 
 
-def humanize_reply(text: str, tone: str = "human_coder") -> str:
+def sticker_ack_reply() -> str:
+    """Short mid-dialog reply so stickers are never left unanswered."""
+    return random.choice(STICKER_ACK_REPLIES)
+
+
+def humanize_reply(text: str, tone: str = "human_coder", *, allow_prices: bool = False) -> str:
     if not text:
         return text
 
@@ -85,11 +114,6 @@ def humanize_reply(text: str, tone: str = "human_coder") -> str:
     t = re.sub(r"^(?:конечно[,!.]?\s*)+", "", t, flags=re.I)
     t = re.sub(r"^(?:отличн\w+ вопрос[,!.]?\s*)+", "", t, flags=re.I)
 
-    # Soften periods → commas occasionally (messenger feel), keep ? !
-    def _soft_period(m: re.Match[str]) -> str:
-        # keep short abbreviations-ish endings alone
-        return ", "
-
     # Only replace mid-sentence periods when followed by capital/cyrillic capital (new sentence)
     t = re.sub(r"\.(?=\s+[A-ZА-ЯЁ])", ",", t)
 
@@ -100,8 +124,10 @@ def humanize_reply(text: str, tone: str = "human_coder") -> str:
         if _NARROW_SCOPE.search(ln):
             dropped_narrow = True
             continue
-        if _PRICE_LINE.search(ln) and not re.search(
-            r"(?i)цен[уаые]\s+(?:чуть|позже|отдельн|скаж)", ln
+        if (
+            not allow_prices
+            and _PRICE_LINE.search(ln)
+            and not re.search(r"(?i)цен[уаые]\s+(?:чуть|позже|отдельн|скаж)", ln)
         ):
             if re.search(r"\d", ln) and re.search(r"(?i)usd|usdt|\$|от\s+\d", ln):
                 continue
@@ -111,7 +137,8 @@ def humanize_reply(text: str, tone: str = "human_coder") -> str:
     elif dropped_narrow:
         t = "да, сделаем, напиши детали задачи"
 
-    if _DEFER_PRICE.search(t):
+    # Never rewrite an already-priced deal into «оценю позже»
+    if not allow_prices and _DEFER_PRICE.search(t):
         t = "уточни что именно нужно по задаче - цену скажу когда всё соберём"
 
     if _ESCROW_PUSH.search(t) and not re.search(r"(?i)да[, ]+можно|гарант\s*\+", t):
@@ -130,7 +157,8 @@ def humanize_reply(text: str, tone: str = "human_coder") -> str:
     t = re.sub(r"\s+,", ",", t)
 
     if not t:
-        return "напишите что нужно - сделаем под задачу"
+        # Caller (dialog_service) applies TZ-aware quality gate after humanize
+        return ""
     return t
 
 

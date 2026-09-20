@@ -30,13 +30,27 @@ from app.services.humanizer import (
     greeting_reply,
     humanize_reply,
     is_greeting_only,
+    sticker_ack_reply,
     sticker_greeting_reply,
+)
+from app.services.message_intel import (
+    MsgKind,
+    classify_message,
+    client_body,
+    enrich_short_pointer_from_history,
+    has_task_substance,
+    ideal_tz_ack,
+    quality_gate_reply,
 )
 from app.services.payment_templates import expand_placeholders_in_text
 from app.services.quick_replies import (
     build_client_offer_message,
     build_escrow_admin_note,
     build_task_admin_note,
+    capability_reply,
+    deal_process_reply,
+    is_capability_question,
+    is_deal_process_question,
     is_escrow_pay_intent,
     is_price_request,
     is_ready_to_pay,
@@ -64,10 +78,10 @@ async def get_or_create_settings(db: AsyncSession) -> AgentSettings:
 
     # Refresh stale prompts when marker missing
     sales = settings.sales_prompt or ""
-    outdated = "PROMPT_V7_OFFER" not in sales
+    outdated = "PROMPT_V10_DEAL_CONTEXT" not in sales
     if outdated:
         settings.orchestrator_prompt = DEFAULT_ORCHESTRATOR_PROMPT
-        settings.sales_prompt = DEFAULT_SALES_PROMPT + "\n\n<!-- PROMPT_V7_OFFER -->"
+        settings.sales_prompt = DEFAULT_SALES_PROMPT + "\n\n<!-- PROMPT_V10_DEAL_CONTEXT -->"
         settings.followup_prompt = DEFAULT_FOLLOWUP_PROMPT
         settings.payment_prompt = DEFAULT_PAYMENT_PROMPT
         settings.tone = "human_coder"
@@ -303,17 +317,24 @@ async def process_incoming_message(
                 Message.role.in_([MessageRole.ASSISTANT, MessageRole.OPERATOR]),
             )
         )
-        # First sticker in a new dialog — greet and offer help
-        if (prior or 0) == 0:
+        total = await db.scalar(
+            select(func.count(Message.id)).where(Message.dialog_id == dialog.id)
+        )
+        # Early dialog → greeting; later → short ack (never silent)
+        if (prior or 0) == 0 or (total or 0) <= 4:
             reply = sticker_greeting_reply()
-            await _save_assistant(db, dialog, reply, "rules", now)
-            await schedule_followup_after_reply(db, dialog, user_message=content)
-            await log_event(db, "agent_response", "rules", dialog.id, {"preview": reply[:120]})
-            return ReplyOutcome.reply(reply)
-        await log_event(db, "message_suppressed", "system", dialog.id, {"reason": "sticker_later"})
-        return ReplyOutcome.silent()
+        else:
+            reply = sticker_ack_reply()
+        await _save_assistant(db, dialog, reply, "rules", now)
+        await schedule_followup_after_reply(db, dialog, user_message=content)
+        await log_event(db, "agent_response", "rules", dialog.id, {"preview": reply[:120]})
+        return ReplyOutcome.reply(reply)
 
-    if is_greeting_only(content):
+    # Short greeting-only — never long TZ that starts with «Привет, …»
+    kind = classify_message(content)
+    if kind == MsgKind.GREETING or (
+        is_greeting_only(client_body(content)) and kind not in (MsgKind.LONG_TZ, MsgKind.TASK, MsgKind.SHORT_POINTER)
+    ):
         reply = greeting_reply()
         await _save_assistant(db, dialog, reply, "rules", now)
         await schedule_followup_after_reply(db, dialog, user_message=content)
@@ -327,21 +348,7 @@ async def process_incoming_message(
         await log_event(db, "agent_response", "rules", dialog.id, {"preview": reply[:120]})
         return ReplyOutcome.reply(reply)
 
-    # Pay via guarantee → admin only, no client reply
-    if is_escrow_pay_intent(content):
-        from app.telegram.client import send_admin_notification
-
-        await send_admin_notification(
-            build_escrow_admin_note(
-                username=username,
-                user_id=telegram_user_id,
-                amount=dialog.quoted_price_usd,
-                tz_summary=dialog.tz_summary or dialog.admin_task_summary or content[:300],
-            )
-        )
-        await log_event(db, "escrow_pay_wait", "system", dialog.id, {"silent": True})
-        return ReplyOutcome.silent()
-
+    # Guarantee FAQ first — «можно через гаранта?» is NOT silent pay-intent
     escrow_quick = match_escrow_guarantee_question(content)
     if escrow_quick:
         await _save_assistant(db, dialog, escrow_quick, "rules", now)
@@ -360,12 +367,36 @@ async def process_incoming_message(
         await log_event(db, "agent_response", "rules", dialog.id, {"preview": escrow_quick[:120]})
         return ReplyOutcome.reply(escrow_quick)
 
-    sensitive = match_sensitive(content)
-    if sensitive:
-        reply = humanize_reply(sensitive, agent_settings.tone)
-        await _save_assistant(db, dialog, reply, "sensitive", now)
+    # Pay via guarantee (decision) → admin only, no client reply
+    if is_escrow_pay_intent(content):
+        from app.telegram.client import send_admin_notification
+
+        await send_admin_notification(
+            build_escrow_admin_note(
+                username=username,
+                user_id=telegram_user_id,
+                amount=dialog.quoted_price_usd,
+                tz_summary=dialog.tz_summary or dialog.admin_task_summary or content[:300],
+            )
+        )
+        await log_event(db, "escrow_pay_wait", "system", dialog.id, {"silent": True})
+        return ReplyOutcome.silent()
+
+    # Sensitive templates must NOT swallow long TZ / task briefs
+    if kind not in (MsgKind.LONG_TZ, MsgKind.TASK, MsgKind.SHORT_POINTER):
+        sensitive = match_sensitive(content)
+        if sensitive:
+            reply = humanize_reply(sensitive, agent_settings.tone)
+            await _save_assistant(db, dialog, reply, "sensitive", now)
+            await schedule_followup_after_reply(db, dialog, user_message=content)
+            await log_event(db, "agent_response", "sensitive", dialog.id, {"preview": reply[:120]})
+            return ReplyOutcome.reply(reply)
+
+    if is_capability_question(content) and kind not in (MsgKind.LONG_TZ, MsgKind.SHORT_POINTER):
+        reply = capability_reply()
+        await _save_assistant(db, dialog, reply, "rules", now)
         await schedule_followup_after_reply(db, dialog, user_message=content)
-        await log_event(db, "agent_response", "sensitive", dialog.id, {"preview": reply[:120]})
+        await log_event(db, "agent_response", "capability", dialog.id, {"preview": reply[:120]})
         return ReplyOutcome.reply(reply)
 
     # Price approved by admin → client asks price → send full offer
@@ -379,6 +410,17 @@ async def process_incoming_message(
         await schedule_followup_after_reply(db, dialog, user_message=content)
         await log_event(db, "agent_response", "offer", dialog.id, {"preview": offer[:120]})
         return ReplyOutcome.reply(offer)
+
+    # After quote (or even before): deal-process FAQ — never re-pitch / re-estimate
+    if is_deal_process_question(content):
+        has_quote = bool(
+            getattr(dialog, "price_approved", False) or dialog.quoted_price_usd
+        )
+        reply = deal_process_reply(has_quote=has_quote)
+        await _save_assistant(db, dialog, reply, "rules", now)
+        await schedule_followup_after_reply(db, dialog, user_message=content)
+        await log_event(db, "agent_response", "deal_faq", dialog.id, {"preview": reply[:120]})
+        return ReplyOutcome.reply(reply)
 
     return await _run_llm_pipeline(
         db,
@@ -514,6 +556,24 @@ async def _run_llm_pipeline(
         select(Message).where(Message.dialog_id == dialog.id).order_by(Message.created_at.asc())
     )
     history = list(result.scalars().all())
+
+    # «тз вот» without reply-to → attach last long client TZ from history
+    content = enrich_short_pointer_from_history(content, history)
+    kind = classify_message(content)
+
+    # Persist TZ early so fallbacks / suppress / admin see it even on silent paths
+    body = client_body(content)
+    if kind in (MsgKind.LONG_TZ, MsgKind.TASK) or len(body) > 80 or media_type in (
+        "voice",
+        "photo",
+        "document",
+    ):
+        dialog.tz_summary = (content if kind != MsgKind.SHORT_POINTER else body)[:2000]
+        if not dialog.tz_summary and body:
+            dialog.tz_summary = body[:2000]
+        if dialog.work_status == WorkStatus.LEAD.value:
+            dialog.work_status = WorkStatus.QUOTING.value
+
     history_text = format_history(history)
     try:
         rag_context = await retrieve_context(content)
@@ -531,9 +591,37 @@ async def _run_llm_pipeline(
         },
     )
     orch["quoted_price_usd"] = dialog.quoted_price_usd
+    orch["quoted_price_max_usd"] = getattr(dialog, "quoted_price_max_usd", None)
+    orch["quoted_days"] = getattr(dialog, "quoted_days", None)
+    orch["price_approved"] = bool(getattr(dialog, "price_approved", False))
+    orch["client_offer_pitch"] = (getattr(dialog, "client_offer_pitch", None) or "")[:300] or orch.get(
+        "client_offer_pitch"
+    )
     orch["tz_summary"] = dialog.tz_summary or dialog.admin_task_summary or ""
     orch["username"] = username or dialog.telegram_username
     orch["telegram_user_id"] = telegram_user_id or dialog.telegram_user_id
+
+    # Force sales + complete flags for clear long TZ / pointer with context
+    # Never re-open "estimate" path once price was already given
+    price_already = bool(getattr(dialog, "price_approved", False) or dialog.quoted_price_usd)
+    if kind in (MsgKind.LONG_TZ, MsgKind.SHORT_POINTER, MsgKind.TASK) and has_task_substance(content) and not price_already:
+        orch["target_agent"] = "sales"
+        orch["is_side_question"] = False
+        if kind == MsgKind.LONG_TZ and len(body) >= 120:
+            orch["requirements_complete"] = True
+            if not orch.get("admin_task_summary"):
+                orch["admin_task_summary"] = body[:1500]
+        elif kind in (MsgKind.TASK, MsgKind.SHORT_POINTER) and len(body) >= 28:
+            orch["requirements_complete"] = True
+            if not orch.get("admin_task_summary"):
+                orch["admin_task_summary"] = body[:1500]
+
+    # Deal/process FAQ must never look like a fresh TZ handoff
+    if is_deal_process_question(content) or orch.get("is_side_question"):
+        orch["requirements_complete"] = False
+        if is_deal_process_question(content):
+            orch["is_side_question"] = True
+            orch["client_offer_pitch"] = None
 
     # Payment intent overrides "awaiting admin quote" silence
     pay_intent = is_ready_to_pay(content) or is_escrow_pay_intent(content)
@@ -542,7 +630,8 @@ async def _run_llm_pipeline(
         orch["ready_for_payment"] = True
         orch["is_side_question"] = True
 
-    if dialog.awaiting_admin_quote and not orch.get("is_side_question") and not pay_intent:
+    # While waiting for admin quote: handle nudges even if orch marks side_question
+    if dialog.awaiting_admin_quote and not pay_intent:
         await _refresh_admin_summary(
             db,
             dialog,
@@ -552,6 +641,27 @@ async def _run_llm_pipeline(
             last_message=content,
             notify=True,
         )
+        # Client nudges about price/timeline while we wait for admin
+        if is_price_request(content):
+            ack = "уже собираю оценку, скоро напишу по цене и срокам"
+            await _save_assistant(db, dialog, ack, "awaiting_price", now)
+            await log_event(db, "agent_response", "awaiting_price", dialog.id, {"preview": ack})
+            await db.flush()
+            return ReplyOutcome.reply(ack)
+        # Client added more TZ / clarification while waiting for price
+        if has_task_substance(content) or kind in (MsgKind.LONG_TZ, MsgKind.SHORT_POINTER, MsgKind.TASK):
+            ack = "ок, докинул в задачу, учту"
+            await _save_assistant(db, dialog, ack, "tz_update", now)
+            await log_event(db, "agent_response", "tz_update", dialog.id, {"preview": ack})
+            await db.flush()
+            return ReplyOutcome.reply(ack)
+        body = client_body(content)
+        if len(body) >= 6:
+            ack = "ок, учёл"
+            await _save_assistant(db, dialog, ack, "tz_update", now)
+            await log_event(db, "agent_response", "tz_update", dialog.id, {"preview": ack})
+            await db.flush()
+            return ReplyOutcome.reply(ack)
         await log_event(
             db,
             "message_suppressed",
@@ -561,11 +671,27 @@ async def _run_llm_pipeline(
         )
         return ReplyOutcome.silent()
 
-    if (
-        orch.get("requirements_complete")
-        and orch.get("admin_task_summary")
-        and not pay_intent
+    # Fresh TZ handoff → admin. NEVER after price already given, NEVER on FAQ/side questions.
+    if should_tz_ack_handoff(
+        price_already=price_already,
+        requirements_complete=bool(orch.get("requirements_complete")),
+        admin_task_summary=orch.get("admin_task_summary"),
+        pay_intent=pay_intent,
+        is_side_question=bool(orch.get("is_side_question")),
+        kind=kind,
+        content=content,
+        awaiting_admin=bool(dialog.awaiting_admin_quote),
     ):
+        # Never silently ignore TZ — always ack client, then hand off to admin
+        ack = ideal_tz_ack(
+            pointer=kind == MsgKind.SHORT_POINTER,
+            content=content,
+        )
+        # Prefer client_offer_pitch style opener if orch gave a pitch
+        pitch = (orch.get("client_offer_pitch") or "").strip()
+        if pitch and not pitch.lower().startswith(("клиент", "тз собрано")):
+            ack = f"{pitch.rstrip(' .,')}, цену скажу когда соберу оценку"
+
         await _activate_awaiting_admin(
             db,
             dialog,
@@ -577,7 +703,10 @@ async def _run_llm_pipeline(
             estimated_days=_as_int(orch.get("estimated_days")),
             client_offer_pitch=(orch.get("client_offer_pitch") or None),
         )
-        return ReplyOutcome.silent()
+        await _save_assistant(db, dialog, ack, "tz_ack", now)
+        await log_event(db, "agent_response", "tz_ack", dialog.id, {"preview": ack[:120]})
+        await db.flush()
+        return ReplyOutcome.reply(ack)
 
     # Keep admin summary warm even before full complete (if LLM gave one)
     if orch.get("admin_task_summary") and not dialog.awaiting_admin_quote and not pay_intent:
@@ -627,7 +756,16 @@ async def _run_llm_pipeline(
             dialog.id,
             {"error": str(e)[:300]},
         )
-        reply = "секунду, чуть подвисло, напишите ещё раз или уточните задачу"
+        if pay_intent and (dialog.quoted_price_usd or getattr(dialog, "price_approved", False)):
+            reply = "секунду, менеджер скинет реквизиты usdt вручную, либо можем через гаранта"
+        else:
+            reply = quality_gate_reply(
+                "секунду, чуть подвисло, напишите ещё раз или уточните задачу",
+                content=content,
+                has_tz_on_file=bool((dialog.tz_summary or "").strip()),
+                kind=kind,
+                price_already=bool(getattr(dialog, "price_approved", False) or dialog.quoted_price_usd),
+            )
         await _save_assistant(db, dialog, reply, "error", now)
         try:
             from app.telegram.client import send_admin_notification
@@ -693,7 +831,7 @@ async def _run_llm_pipeline(
             )
 
     if not response:
-        response = "напишите что нужно - сделаем под задачу"
+        response = _empty_sales_fallback(dialog, history, content)
 
     # Don't humanize payment templates (HTML + address/amount)
     is_payment_tpl = active_agent == "payment" and (
@@ -703,7 +841,24 @@ async def _run_llm_pipeline(
         or "txid" in (response or "").lower()
     )
     if not is_payment_tpl:
-        response = humanize_reply(response, agent_settings.tone)
+        allow_prices = bool(getattr(dialog, "price_approved", False) or dialog.quoted_price_usd)
+        response = humanize_reply(
+            response,
+            agent_settings.tone,
+            allow_prices=allow_prices,
+        )
+        has_tz = bool(
+            (dialog.tz_summary or "").strip()
+            or (dialog.admin_task_summary or "").strip()
+            or kind in (MsgKind.LONG_TZ, MsgKind.TASK, MsgKind.SHORT_POINTER)
+        )
+        response = quality_gate_reply(
+            response,
+            content=content,
+            has_tz_on_file=has_tz,
+            kind=kind,
+            price_already=allow_prices,
+        )
     amount = dialog.quoted_price_usd or float(payment_data.get("amount_usdt") or 0)
     response = await expand_placeholders_in_text(response, amount=amount)
 
@@ -750,6 +905,62 @@ def _as_float(v) -> float | None:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def should_tz_ack_handoff(
+    *,
+    price_already: bool,
+    requirements_complete: bool,
+    admin_task_summary,
+    pay_intent: bool,
+    is_side_question: bool,
+    kind: MsgKind,
+    content: str,
+    awaiting_admin: bool = False,
+) -> bool:
+    """True only for first handoff of a real TZ — never after quote / FAQ."""
+    if pay_intent or price_already or is_side_question or awaiting_admin:
+        return False
+    if not requirements_complete or not admin_task_summary:
+        return False
+    if is_deal_process_question(content) or is_price_request(content):
+        return False
+    # Only on real TZ briefs — short «делаете ботов?» must NOT hand off
+    if kind == MsgKind.LONG_TZ:
+        return True
+    if kind == MsgKind.SHORT_POINTER:
+        return True
+    if kind == MsgKind.TASK and len(client_body(content)) >= 28 and has_task_substance(content):
+        return True
+    return has_task_substance(content) and len(client_body(content)) >= 80
+
+
+def _empty_sales_fallback(
+    dialog: Dialog,
+    history: list[Message],
+    content: str,
+) -> str:
+    """Fallback when LLM returns empty — acknowledge TZ if already in context."""
+    kind = classify_message(content)
+    price_already = bool(getattr(dialog, "price_approved", False) or dialog.quoted_price_usd)
+    has_tz = bool(
+        (dialog.tz_summary or "").strip()
+        or (dialog.admin_task_summary or "").strip()
+        or kind in (MsgKind.LONG_TZ, MsgKind.TASK, MsgKind.SHORT_POINTER)
+    )
+    if not has_tz:
+        for msg in history:
+            if msg.role == MessageRole.USER and len(client_body(msg.content or "")) > 80:
+                has_tz = True
+                break
+    if price_already:
+        return deal_process_reply(has_quote=True)
+    if has_tz:
+        return ideal_tz_ack(
+            pointer=kind == MsgKind.SHORT_POINTER,
+            content=content or (dialog.tz_summary or ""),
+        )
+    return "напишите что нужно - сделаем под задачу"
 
 
 def _as_int(v) -> int | None:

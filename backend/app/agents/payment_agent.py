@@ -80,8 +80,23 @@ async def generate_payment_response(
     low = (user_message or "").lower()
     payment_data: dict = {}
 
-    extract = await generate_json(
-        f"""Извлеки из диалога сумму и описание заказа.
+    # Prefer deal facts — don't burn LLM quota just to re-extract known price
+    has_quote = bool(orchestrator_hint.get("quoted_price_usd") or orchestrator_hint.get("extracted_amount"))
+    if has_quote and (
+        orchestrator_hint.get("ready_for_payment")
+        or _is_ready(user_message)
+        or any(w in low for w in ("usdt", "реквизит", "плачу", "оплач", "кидать", "кину"))
+    ):
+        extract = {
+            "amount_usdt": float(orchestrator_hint.get("quoted_price_usd") or orchestrator_hint.get("extracted_amount") or 0),
+            "description": orchestrator_hint.get("tz_summary") or orchestrator_hint.get("extracted_product") or "Заказ",
+            "wants_escrow": _wants_escrow_pay(user_message),
+            "wants_direct": any(w in low for w in ("usdt", "trc", "реквизит", "напрямую")),
+            "ready": True,
+        }
+    else:
+        extract = await generate_json(
+            f"""Извлеки из диалога сумму и описание заказа.
 История:
 {conversation_history}
 
@@ -91,8 +106,8 @@ async def generate_payment_response(
 
 JSON:
 {{"amount_usdt": 0, "description": "краткое описание товара/услуги", "wants_escrow": false, "wants_direct": false, "ready": false}}""",
-        "Ты финансовый экстрактор. Только JSON.",
-    )
+            "Ты финансовый экстрактор. Только JSON.",
+        )
 
     amount = float(
         extract.get("amount_usdt")
