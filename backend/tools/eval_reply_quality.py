@@ -29,8 +29,10 @@ from app.database import Base, async_session, engine  # noqa: E402
 from app.db import bot_extensions as _bot_ext  # noqa: F401, E402
 from app.db import models as _models  # noqa: F401, E402
 from app.db import platform_models as _platform  # noqa: F401, E402
+from app.db.models import Dialog  # noqa: E402
 from app.services.dialog_service import process_incoming_message  # noqa: E402
 from app.services.message_intel import is_stock_reply  # noqa: E402
+from sqlalchemy import select  # noqa: E402
 
 WB_TZ = """Привет, нашел твой контакт у скруджа
 Подскажи, такая задача:
@@ -62,6 +64,12 @@ def _check(name: str, reply: str, must_have: tuple[str, ...], must_not: tuple[st
     for token in must_not:
         if token in low:
             _fail(f"{name}: unexpected {token!r}: {text}")
+
+
+async def _summary(uid: int) -> str:
+    async with async_session() as db:
+        dialog = await db.scalar(select(Dialog).where(Dialog.telegram_user_id == uid))
+        return ((dialog.tz_summary if dialog else "") or "").strip()
 
 
 async def _turn(uid: int, text: str, mid: int) -> str:
@@ -109,6 +117,13 @@ async def main() -> None:
 
     edits = await _turn(91001, "там не про новое тз, можно ли правки после сдачи?", 4)
     _check("edits question", edits, ("правк", "сдач", "поддерж"), ("тз вижу", "ок, учёл", "ок, учел"))
+
+    stored = (await _summary(91001)).lower()
+    print(f"\n== stored brief\n{stored}\n")
+    if "парсер" not in stored:
+        _fail(f"brief lost the parser task: {stored}")
+    if "правки" in stored or stored.startswith("токены"):
+        _fail(f"side message replaced the brief: {stored}")
 
     print("reply quality checks passed")
 

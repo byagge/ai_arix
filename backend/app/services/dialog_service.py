@@ -39,8 +39,12 @@ from app.services.message_intel import (
     client_body,
     enrich_short_pointer_from_history,
     has_task_substance,
+    brief_anchors,
     is_short_question,
     is_stock_reply,
+    merge_task_summary,
+    reply_tracks_brief,
+    usable_client_pitch,
     quality_gate_reply,
 )
 from app.services.payment_templates import expand_placeholders_in_text
@@ -588,12 +592,21 @@ async def _compose_sales_reply(
             price_already=allow_prices,
         )
 
+    def _ok(text: str) -> bool:
+        return bool(text) and not is_stock_reply(text) and reply_tracks_brief(text, content)
+
     first = await once("")
-    if first and not is_stock_reply(first):
+    if _ok(first):
         return first
-    second = await once(_STOCK_RETRY)
-    if second and not is_stock_reply(second):
+    anchors = brief_anchors(content)
+    retry = _STOCK_RETRY
+    if anchors:
+        retry += " В ответе обязаны быть эти детали из сообщения клиента: " + ", ".join(anchors[:5]) + "."
+    second = await once(retry)
+    if _ok(second):
         return second
+    if anchors and has_task_substance(content):
+        return f"{', '.join(anchors[:4])} берём в работу, цену назову когда закрою оценку"
     if first and not is_stock_reply(first):
         return first
     clip = re.sub(r"\s+", " ", client_body(content)).strip()[:160]
@@ -1065,20 +1078,20 @@ async def _refresh_admin_summary(
     last_message: str,
     notify: bool,
 ) -> None:
-    summary = (orch.get("admin_task_summary") or "").strip()
-    if not summary:
-        snippet = (last_message or "").strip()[:500]
-        if snippet:
-            base = (dialog.admin_task_summary or dialog.tz_summary or "").strip()
-            summary = f"{base}\n{snippet}".strip() if base and snippet not in base else (base or snippet)
+    existing = (dialog.admin_task_summary or dialog.tz_summary or "").strip()
+    summary = merge_task_summary(existing, orch.get("admin_task_summary") or "", last_message)
     if not summary:
         return
+    # A side message must not replace the brief the admin and the offer are built from.
+    if summary == existing and not (orch.get("client_offer_pitch") or "").strip():
+        if not notify:
+            return
 
     dialog.admin_task_summary = summary[:2000]
     dialog.tz_summary = summary[:2000]
-    pitch = (orch.get("client_offer_pitch") or "").strip()
-    if pitch:
-        dialog.client_offer_pitch = pitch[:1000]
+    pitch = usable_client_pitch(orch.get("client_offer_pitch") or "")
+    if pitch and summary != existing:
+        dialog.client_offer_pitch = pitch
     est = _as_float(orch.get("estimated_price_usd"))
     days = _as_int(orch.get("estimated_days"))
     if est is not None:
@@ -1132,8 +1145,9 @@ async def _activate_awaiting_admin(
     dialog.work_status = WorkStatus.AWAITING_ADMIN.value
     dialog.admin_task_summary = summary
     dialog.tz_summary = summary
-    if client_offer_pitch:
-        dialog.client_offer_pitch = client_offer_pitch.strip()[:1000]
+    pitch = usable_client_pitch(client_offer_pitch or "")
+    if pitch:
+        dialog.client_offer_pitch = pitch
     dialog.followup_mode = FollowupMode.NONE.value
     dialog.next_followup_at = None
     if estimated_price_usd is not None:
@@ -1171,7 +1185,7 @@ async def _activate_awaiting_admin(
 
 
 async def _ensure_client_pitch(db: AsyncSession, dialog: Dialog) -> str:
-    pitch = (getattr(dialog, "client_offer_pitch", None) or "").strip()
+    pitch = usable_client_pitch(getattr(dialog, "client_offer_pitch", None) or "")
     if pitch and not re.search(r"(?i)клиент\s+запрос|тз\s+собрано|нужна\s+точн", pitch):
         return pitch
 
@@ -1190,7 +1204,7 @@ async def _ensure_client_pitch(db: AsyncSession, dialog: Dialog) -> str:
             temperature=0.4,
             prefer="gemini",
         )
-        pitch = (pitch or "").strip().strip('"')
+        pitch = usable_client_pitch((pitch or "").strip().strip('"'))
     except Exception:
         pitch = ""
     if not pitch:

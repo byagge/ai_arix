@@ -209,6 +209,12 @@ def main() -> None:
             "must not replace the brief",
         ),
         _assert(not is_short_question(WB_TZ), "long brief stays a brief"),
+        _assert(
+            not is_short_question(
+                "нужен парсер вб, 5к запросов за 15 минут, 6 прокси и дока. сколько будет?"
+            ),
+            "compact spec with a price question stays a brief",
+        ),
         _assert(is_stock_reply("тз вижу, парсер под ваши условия сделаем"), "stock"),
         _assert(is_stock_reply("ок, учёл"), "stock ack"),
         _assert(not is_stock_reply("токены тогда не считаю, в объёме парсер и дока"), "specific"),

@@ -32,12 +32,6 @@ _NARROW_SCOPE = re.compile(
     r"(?i)(?:мы\s+больше\s+по|не\s+наш\s+профиль|специализируемся\s+на|"
     r"обычно\s+делаем\s+только|это\s+не\s+наше)"
 )
-_DEFER_PRICE = re.compile(
-    r"(?i)(?:по\s+цен[еы]\s+чуть\s+позже|сориентиру(?:ю|ем)\s+по\s+цен|"
-    r"сначала\s+зафиксируем\s+объ[её]м|цен[уа]\s+позже\s+напиш)"
-)
-
-
 def is_greeting_only(text: str) -> bool:
     """True only if the whole message is a short greeting (not «Привет,» + task)."""
     t = (text or "").strip()
@@ -136,10 +130,6 @@ def humanize_reply(text: str, tone: str = "human_coder", *, allow_prices: bool =
         t = "\n".join(cleaned)
     elif dropped_narrow:
         t = "да, сделаем, напиши детали задачи"
-
-    # Never rewrite an already-priced deal into «оценю позже»
-    if not allow_prices and _DEFER_PRICE.search(t):
-        t = "уточни что именно нужно по задаче - цену скажу когда всё соберём"
 
     if _ESCROW_PUSH.search(t) and not re.search(r"(?i)да[, ]+можно|гарант\s*\+", t):
         parts = re.split(r"(?<=[.!?])\s+", t)
