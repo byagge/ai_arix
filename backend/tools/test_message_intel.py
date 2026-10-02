@@ -13,6 +13,7 @@ from app.services.message_intel import (
     classify_message,
     enrich_short_pointer_from_history,
     ideal_tz_ack,
+    is_stock_reply,
     quality_gate_reply,
 )
 
@@ -54,16 +55,19 @@ def main() -> None:
         content=WB_TZ,
         has_tz_on_file=False,
     )
-    assert "привет, слушаю" not in fixed.lower() or "парсер" in fixed.lower()
-    assert "слушаю" not in fixed or "тз" in fixed.lower() or "парсер" in fixed.lower()
-    assert fixed != "привет, слушаю"
+    assert fixed == ""
+    assert not is_stock_reply(fixed)
 
     fixed2 = quality_gate_reply(
         "напишите что нужно - сделаем под задачу",
         content=enriched,
         has_tz_on_file=True,
     )
-    assert "напишите что нужно" not in fixed2.lower()
+    assert fixed2 == ""
+    assert is_stock_reply("тз вижу, парсер под ваши условия сделаем")
+    assert is_stock_reply("ок, учёл")
+    assert is_stock_reply("ок, докинул в задачу, учту")
+    assert not is_stock_reply("токены тогда не считаю, в объёме парсер и дока")
 
     hist = [_Msg("user", WB_TZ)]
     pointer = enrich_short_pointer_from_history("тз вот", hist)
@@ -71,7 +75,7 @@ def main() -> None:
     assert "парсер" in pointer.lower()
 
     ack = ideal_tz_ack(content=WB_TZ)
-    assert "парсер" in ack.lower() or "тз" in ack.lower()
+    assert is_stock_reply(ack), ack
 
     print("OK — classifier + quality gate pass on Reign-style TZ")
 

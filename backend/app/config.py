@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-4o-mini"
     # Point at any OpenAI-compatible endpoint (vLLM, Ollama, a gateway, ...)
     openai_base_url: str = ""
+    # Used only when Gemini is missing or its balance/quota is exhausted.
+    bardborn_api_key: str = ""
+    bardborn_base_url: str = "https://bardborn.lol/v1"
+    bardborn_model: str = "gemini-3.6-flash"
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-3-5-haiku-latest"
     llm_primary: str = "gemini"  # gemini | openai | anthropic

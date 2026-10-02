@@ -50,6 +50,29 @@ BAD_REPEAT_PITCH = re.compile(
 
 REPLY_CTX_MARK = "[клиент отвечает на сообщение]"
 
+# Openers that ignore what the client actually said. Never send these.
+STOCK_OPENER = re.compile(
+    r"(?i)^(?:"
+    r"тз\s+вижу|"
+    r"тз\s+принял(?:а)?|"
+    r"ок,?\s*уч[её]л|"
+    r"ок,?\s*докинул|"
+    r"ок,?\s*задачу|"
+    r"ок,?\s*по\s+\S+\s+задачу"
+    r")"
+)
+
+EXACT_STOCK_REPLIES = {
+    "уже собираю оценку, скоро напишу по цене и срокам",
+    "напишите что нужно - сделаем под задачу",
+    "привет, слушаю",
+    "тз вижу, по объёму реально, сейчас оценю и вернусь с ценой и сроками",
+    "ок, задачу разобрал, чуть уточню нюансы внутри и напишу цену",
+    "тз принял, по такой нагрузке сделаем, цену скажу когда соберу оценку",
+    "тз вижу, сейчас разберу и вернусь с оценкой",
+    "ок, задачу по цитате вижу, оценю и напишу",
+}
+
 TZ_ACK_REPLIES = [
     "тз вижу, по объёму реально, сейчас оценю и вернусь с ценой и сроками",
     "ок, задачу разобрал, чуть уточню нюансы внутри и напишу цену",
@@ -90,6 +113,16 @@ def has_task_substance(content: str) -> bool:
     return False
 
 
+def is_short_question(content: str) -> bool:
+    """A short question is not a new brief, even if it mentions the word «тз»."""
+    body = client_body(content).strip()
+    if not body or len(body) >= 180 or body.count("\n") >= 3:
+        return False
+    if body.endswith("?"):
+        return True
+    return bool(re.match(r"(?i)^(?:а\s+|можно\s+|есть\s+ли\s+|вы\s+)", body))
+
+
 def is_short_pointer(content: str) -> bool:
     body = client_body(content)
     if has_reply_context(content) and len(body) <= 40:
@@ -117,9 +150,23 @@ def classify_message(content: str) -> MsgKind:
     return MsgKind.OTHER
 
 
+def is_stock_reply(reply: str) -> bool:
+    """True for canned acks that do not track the client's last message."""
+    t = re.sub(r"\s+", " ", (reply or "").strip()).strip(" .,!")
+    if not t:
+        return False
+    if t.lower() in EXACT_STOCK_REPLIES:
+        return True
+    if STOCK_OPENER.match(t):
+        return True
+    return False
+
+
 def looks_like_bad_reply(reply: str, *, has_tz: bool, price_already: bool = False) -> bool:
     t = (reply or "").strip()
     if not t:
+        return True
+    if is_stock_reply(t):
         return True
     if BAD_GREETING_REPLY.match(t):
         return True
@@ -169,20 +216,29 @@ def quality_gate_reply(
     kind: MsgKind | None = None,
     price_already: bool = False,
 ) -> str:
-    """Replace greeting / ask-again / re-estimate garbage with a solid reply."""
+    """Drop stock acks so the caller can generate a reply that matches the message.
+
+    After a price is already on the deal, a re-pitch becomes the deal-process answer.
+    Otherwise a bad reply becomes empty: never substitute «тз вижу» / «ок, учёл».
+    """
     kind = kind or classify_message(content)
     has_tz = has_tz_on_file or kind in (MsgKind.LONG_TZ, MsgKind.TASK, MsgKind.SHORT_POINTER)
-    if not looks_like_bad_reply(reply, has_tz=has_tz, price_already=price_already):
-        return (reply or "").strip()
+    text = (reply or "").strip()
+    if is_stock_reply(text):
+        if price_already:
+            from app.services.quick_replies import deal_process_reply
+
+            return deal_process_reply(has_quote=True)
+        return ""
+    if not looks_like_bad_reply(text, has_tz=has_tz, price_already=price_already):
+        return text
     if price_already:
         from app.services.quick_replies import deal_process_reply
 
         return deal_process_reply(has_quote=True)
-    if kind == MsgKind.SHORT_POINTER or has_reply_context(content):
-        return ideal_tz_ack(pointer=True, content=content)
-    if kind in (MsgKind.LONG_TZ, MsgKind.TASK) or has_tz_on_file:
-        return ideal_tz_ack(pointer=False, content=content)
-    return (reply or "").strip() or "напишите что нужно - сделаем под задачу"
+    if has_tz or kind in (MsgKind.LONG_TZ, MsgKind.TASK, MsgKind.SHORT_POINTER, MsgKind.OTHER):
+        return ""
+    return text
 
 
 def last_long_user_text(history_msgs: list, *, min_len: int = 80) -> str | None:

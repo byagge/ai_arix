@@ -15,6 +15,8 @@ from app.services.humanizer import humanize_reply
 from app.services.message_intel import (
     MsgKind,
     classify_message,
+    is_short_question,
+    is_stock_reply,
     looks_like_bad_reply,
     quality_gate_reply,
 )
@@ -190,6 +192,26 @@ def main() -> None:
         _assert("делаем высокоскоростной" not in reply.lower(), reply),
         _assert("соберу оценку" not in reply.lower(), reply),
         _assert("гарант" in reply.lower() or "оплата" in reply.lower(), reply),
+    ))
+
+    scenario("17. short question is not a new TZ handoff", lambda: (
+        _assert(is_short_question("там не про новое тз, можно ли правки после сдачи?"), "question"),
+        _assert(
+            not should_tz_ack_handoff(
+                price_already=False,
+                requirements_complete=True,
+                admin_task_summary="парсер вб",
+                pay_intent=False,
+                is_side_question=False,
+                kind=MsgKind.TASK,
+                content="там не про новое тз, можно ли правки после сдачи?",
+            ),
+            "must not replace the brief",
+        ),
+        _assert(not is_short_question(WB_TZ), "long brief stays a brief"),
+        _assert(is_stock_reply("тз вижу, парсер под ваши условия сделаем"), "stock"),
+        _assert(is_stock_reply("ок, учёл"), "stock ack"),
+        _assert(not is_stock_reply("токены тогда не считаю, в объёме парсер и дока"), "specific"),
     ))
 
     print("\nAll scenarios passed.")
