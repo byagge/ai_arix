@@ -39,6 +39,7 @@ async def generate_sales_response(
     rag_context: str,
     settings: dict,
     orchestrator_hint: dict,
+    extra_rules: str = "",
 ) -> str:
     tone = settings.get("tone", "professional_friendly")
     system = settings.get("sales_prompt") or DEFAULT_SALES_PROMPT
@@ -64,9 +65,16 @@ async def generate_sales_response(
     if (kind == MsgKind.LONG_TZ or has_task_substance(user_message)) and not price_already:
         extra.append(
             "СЕЙЧАС у клиента уже есть ТЗ в сообщении. "
-            "Запрещены ответы: «привет», «привет, слушаю», «напишите что нужно», «чем могу помочь». "
-            "Подтверди задачу по сути (1 фраза) + максимум один уточняющий вопрос ИЛИ скажи что оценишь и вернёшься с ценой."
+            "Запрещены ответы: «привет», «привет, слушаю», «напишите что нужно», «чем могу помочь», "
+            "«тз вижу», «тз принял», «ок, учел», «ок, учёл», «ок, докинул». "
+            "Назови конкретную деталь из его текста и максимум один уточняющий вопрос."
         )
+    extra.append(
+        "Нельзя отвечать штампом. Если последнее сообщение - уточнение или вопрос, "
+        "ответь на него, а не подтверждай ТЗ заново."
+    )
+    if extra_rules:
+        extra.append(extra_rules.strip())
     if kind == MsgKind.SHORT_POINTER or has_reply_context(user_message):
         extra.append(
             "Клиент указал на предыдущее ТЗ коротко («вот» / reply). "

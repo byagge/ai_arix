@@ -10,15 +10,37 @@ from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
+_BALANCE_MARKERS = (
+    "quota",
+    "resource_exhausted",
+    "resource exhausted",
+    "billing",
+    "exceeded",
+    "insufficient",
+    "credit",
+    "balance",
+    "429",
+    "too many requests",
+    "rate limit",
+    "payment required",
+    "402",
+)
+
 
 def _settings():
     return get_settings()
+
+
+def _is_balance_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _BALANCE_MARKERS)
 
 
 def _has_any_llm_key() -> bool:
     settings = _settings()
     return bool(
         settings.google_api_key
+        or settings.bardborn_api_key
         or (settings.openai_api_key and settings.openai_api_key != "local" and not settings.openai_base_url)
         or (settings.openai_api_key and settings.openai_base_url)
         or settings.anthropic_api_key
@@ -39,10 +61,34 @@ async def generate_text(
         order = [settings.llm_primary] + [x for x in order if x != settings.llm_primary]
 
     errors: list[str] = []
+    # Sales and routing ask for Gemini first. Bardborn is only the quota fallback
+    # (or the stand-in when no Gemini key is configured at all).
+    gemini_first = prefer not in ("openai", "anthropic")
+    if gemini_first and settings.google_api_key:
+        try:
+            return await _gemini(prompt, system_instruction, temperature)
+        except Exception as e:
+            logger.warning("LLM gemini failed: %s", e)
+            errors.append(f"gemini: {e}")
+            if _is_balance_error(e) and settings.bardborn_api_key:
+                try:
+                    logger.info("Gemini balance exhausted, switching to bardborn")
+                    return await _bardborn(prompt, system_instruction, temperature)
+                except Exception as gateway_error:
+                    logger.warning("LLM bardborn failed: %s", gateway_error)
+                    errors.append(f"bardborn: {gateway_error}")
+    elif gemini_first and settings.bardborn_api_key and not settings.google_api_key:
+        try:
+            logger.info("Gemini key is empty, using bardborn gateway")
+            return await _bardborn(prompt, system_instruction, temperature)
+        except Exception as gateway_error:
+            logger.warning("LLM bardborn failed: %s", gateway_error)
+            errors.append(f"bardborn: {gateway_error}")
+
     for provider in order:
         try:
-            if provider == "gemini" and settings.google_api_key:
-                return await _gemini(prompt, system_instruction, temperature)
+            if provider == "gemini":
+                continue
             if provider == "openai" and settings.openai_api_key:
                 return await _openai(prompt, system_instruction, temperature)
             if provider == "anthropic" and settings.anthropic_api_key:
@@ -61,11 +107,13 @@ async def generate_json(
     prompt: str,
     system_instruction: str,
     temperature: float = 0.2,
+    prefer: str | None = "gemini",
 ) -> dict[str, Any]:
     text = await generate_text(
         prompt + "\n\nRespond ONLY with valid JSON, no markdown.",
         system_instruction=system_instruction,
         temperature=temperature,
+        prefer=prefer,
     )
     text = re.sub(r"^```json\s*", "", text.strip())
     text = re.sub(r"\s*```$", "", text)
@@ -136,6 +184,49 @@ async def _gemini(prompt: str, system: str | None, temperature: float) -> str:
             logger.warning("Gemini model %s failed: %s", model_name, e)
             continue
     raise RuntimeError(f"All Gemini models failed: {last_err}")
+
+
+async def _bardborn(prompt: str, system: str | None, temperature: float) -> str:
+    """OpenAI-compatible gateway. Called only after Gemini cannot answer."""
+    from openai import AsyncOpenAI
+
+    settings = _settings()
+    client = AsyncOpenAI(
+        api_key=settings.bardborn_api_key,
+        base_url=(settings.bardborn_base_url or "https://bardborn.lol/v1").rstrip("/"),
+        timeout=60.0,
+    )
+    models: list[str] = []
+    for name in (
+        settings.bardborn_model,
+        "gemini-3.6-flash",
+        "gemini-3.7-flash",
+        "gemini-3.8-flash",
+    ):
+        if name and name not in models:
+            models.append(name)
+    messages: list[dict[str, str]] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    last_err: Exception | None = None
+    for model_name in models:
+        try:
+            resp = await client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                temperature=temperature,
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            if not text:
+                raise RuntimeError(f"empty bardborn response ({model_name})")
+            if model_name != settings.bardborn_model:
+                logger.info("bardborn fallback model used: %s", model_name)
+            return text
+        except Exception as e:
+            last_err = e
+            logger.warning("bardborn model %s failed: %s", model_name, e)
+    raise RuntimeError(f"All bardborn models failed: {last_err}")
 
 
 def _openai_client():
@@ -220,17 +311,16 @@ def _heuristic_reply(prompt: str, system: str | None) -> str:
         )
 
     from app.services.message_intel import (
+        client_body,
         has_reply_context,
         has_task_substance,
-        ideal_tz_ack,
         is_short_pointer,
     )
 
     if has_task_substance(focus) or has_reply_context(focus) or is_short_pointer(focus):
-        return ideal_tz_ack(
-            pointer=is_short_pointer(focus) or has_reply_context(focus),
-            content=focus,
-        )
+        # Last resort only. Echo the client text instead of a shared «тз вижу» stamp.
+        clip = re.sub(r"\s+", " ", client_body(focus)).strip()[:180]
+        return f"по вашему сообщению: {clip}. отвечу по этим условиям, без общей отписки"
 
     # Escrow only if CLIENT asked
     if any(w in lower for w in ("гарант", "escrow")):

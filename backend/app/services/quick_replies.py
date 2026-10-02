@@ -79,6 +79,9 @@ def capability_reply() -> str:
 
 
 def is_price_request(text: str) -> bool:
+    # A full brief that also asks «сколько будет стоить» is still a TZ, not a price nudge.
+    if len((text or "").strip()) > 220:
+        return False
     lower = (text or "").lower()
     return bool(
         re.search(

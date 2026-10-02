@@ -39,7 +39,12 @@ from app.services.message_intel import (
     client_body,
     enrich_short_pointer_from_history,
     has_task_substance,
-    ideal_tz_ack,
+    brief_anchors,
+    is_short_question,
+    is_stock_reply,
+    merge_task_summary,
+    reply_tracks_brief,
+    usable_client_pitch,
     quality_gate_reply,
 )
 from app.services.payment_templates import expand_placeholders_in_text
@@ -78,10 +83,10 @@ async def get_or_create_settings(db: AsyncSession) -> AgentSettings:
 
     # Refresh stale prompts when marker missing
     sales = settings.sales_prompt or ""
-    outdated = "PROMPT_V10_DEAL_CONTEXT" not in sales
+    outdated = "PROMPT_V11_CONTEXTUAL" not in sales
     if outdated:
         settings.orchestrator_prompt = DEFAULT_ORCHESTRATOR_PROMPT
-        settings.sales_prompt = DEFAULT_SALES_PROMPT + "\n\n<!-- PROMPT_V10_DEAL_CONTEXT -->"
+        settings.sales_prompt = DEFAULT_SALES_PROMPT + "\n\n<!-- PROMPT_V11_CONTEXTUAL -->"
         settings.followup_prompt = DEFAULT_FOLLOWUP_PROMPT
         settings.payment_prompt = DEFAULT_PAYMENT_PROMPT
         settings.tone = "human_coder"
@@ -538,6 +543,78 @@ async def generate_ai_reply_for_dialog(
     return outcome.text if outcome.should_send() else None
 
 
+_STOCK_RETRY = (
+    "Предыдущий вариант отправлять нельзя: это штамп «тз вижу» / «ок, учёл» / «ок, докинул». "
+    "Напиши заново. Первые слова не могут быть «тз» или «ок, учел». "
+    "Вставь конкретную деталь из последнего сообщения клиента."
+)
+
+
+async def _compose_sales_reply(
+    *,
+    content: str,
+    history_text: str,
+    rag_context: str,
+    agent_settings: AgentSettings,
+    orch: dict,
+    allow_prices: bool,
+    extra_rules: str = "",
+) -> str:
+    """Gemini (then bardborn on quota) reply that must track the last client message."""
+    from app.agents.sales import generate_sales_response
+
+    settings_payload = {
+        "orchestrator_prompt": agent_settings.orchestrator_prompt,
+        "sales_prompt": agent_settings.sales_prompt,
+        "followup_prompt": agent_settings.followup_prompt,
+        "payment_prompt": agent_settings.payment_prompt,
+        "tone": agent_settings.tone,
+        "autonomy_level": agent_settings.autonomy_level,
+        "max_followups": agent_settings.max_followups,
+        "discount_max_percent": agent_settings.discount_max_percent,
+    }
+
+    async def once(extra: str) -> str:
+        raw = await generate_sales_response(
+            user_message=content,
+            conversation_history=history_text,
+            rag_context=rag_context,
+            settings=settings_payload,
+            orchestrator_hint=orch,
+            extra_rules=(f"{extra_rules}\n{extra}").strip(),
+        )
+        text = humanize_reply(raw or "", agent_settings.tone, allow_prices=allow_prices)
+        return quality_gate_reply(
+            text,
+            content=content,
+            has_tz_on_file=True,
+            kind=classify_message(content),
+            price_already=allow_prices,
+        )
+
+    def _ok(text: str) -> bool:
+        return bool(text) and not is_stock_reply(text) and reply_tracks_brief(text, content)
+
+    first = await once("")
+    if _ok(first):
+        return first
+    anchors = brief_anchors(content)
+    retry = _STOCK_RETRY
+    if anchors:
+        retry += " В ответе обязаны быть эти детали из сообщения клиента: " + ", ".join(anchors[:5]) + "."
+    second = await once(retry)
+    if _ok(second):
+        return second
+    if anchors and has_task_substance(content):
+        return f"{', '.join(anchors[:4])} берём в работу, цену назову когда закрою оценку"
+    if first and not is_stock_reply(first):
+        return first
+    clip = re.sub(r"\s+", " ", client_body(content)).strip()[:160]
+    if clip:
+        return f"по сообщению вижу «{clip}», отвечу по этому, не общей фразой"
+    return "гляну сообщение и отвечу по сути"
+
+
 async def _run_llm_pipeline(
     db: AsyncSession,
     *,
@@ -616,6 +693,13 @@ async def _run_llm_pipeline(
             if not orch.get("admin_task_summary"):
                 orch["admin_task_summary"] = body[:1500]
 
+    # «можно ли правки?» / «там не про новое тз» must not replace the stored brief.
+    if is_short_question(content):
+        orch["requirements_complete"] = False
+        orch["is_side_question"] = True
+        orch["admin_task_summary"] = None
+        orch["client_offer_pitch"] = None
+
     # Deal/process FAQ must never look like a fresh TZ handoff
     if is_deal_process_question(content) or orch.get("is_side_question"):
         orch["requirements_complete"] = False
@@ -630,7 +714,8 @@ async def _run_llm_pipeline(
         orch["ready_for_payment"] = True
         orch["is_side_question"] = True
 
-    # While waiting for admin quote: handle nudges even if orch marks side_question
+    # While waiting for admin quote: still answer the actual message.
+    # Do not stamp every turn with «ок, учёл» / «ок, докинул».
     if dialog.awaiting_admin_quote and not pay_intent:
         await _refresh_admin_summary(
             db,
@@ -641,35 +726,30 @@ async def _run_llm_pipeline(
             last_message=content,
             notify=True,
         )
-        # Client nudges about price/timeline while we wait for admin
-        if is_price_request(content):
-            ack = "уже собираю оценку, скоро напишу по цене и срокам"
-            await _save_assistant(db, dialog, ack, "awaiting_price", now)
-            await log_event(db, "agent_response", "awaiting_price", dialog.id, {"preview": ack})
-            await db.flush()
-            return ReplyOutcome.reply(ack)
-        # Client added more TZ / clarification while waiting for price
-        if has_task_substance(content) or kind in (MsgKind.LONG_TZ, MsgKind.SHORT_POINTER, MsgKind.TASK):
-            ack = "ок, докинул в задачу, учту"
-            await _save_assistant(db, dialog, ack, "tz_update", now)
-            await log_event(db, "agent_response", "tz_update", dialog.id, {"preview": ack})
-            await db.flush()
-            return ReplyOutcome.reply(ack)
-        body = client_body(content)
-        if len(body) >= 6:
-            ack = "ок, учёл"
-            await _save_assistant(db, dialog, ack, "tz_update", now)
-            await log_event(db, "agent_response", "tz_update", dialog.id, {"preview": ack})
-            await db.flush()
-            return ReplyOutcome.reply(ack)
-        await log_event(
-            db,
-            "message_suppressed",
-            "system",
-            dialog.id,
-            {"reason": "awaiting_admin_task_update"},
+        extra = (
+            "Админ ещё не утвердил цену. Сумму в долларах не называй. "
+            "Запрещены штампы «тз вижу», «тз принял», «ок, учел», «ок, учёл», «ок, докинул»."
         )
-        return ReplyOutcome.silent()
+        if is_price_request(content):
+            extra += (
+                " Клиент спрашивает цену или сроки. Скажи что цифра ещё считается, "
+                "и привяжи ответ к его задаче, без выдуманной суммы."
+            )
+        else:
+            extra += " Ответь по смыслу последнего сообщения, не подтверждай ТЗ заново одной фразой."
+        ack = await _compose_sales_reply(
+            content=content,
+            history_text=history_text,
+            rag_context=rag_context,
+            agent_settings=agent_settings,
+            orch=orch,
+            allow_prices=False,
+            extra_rules=extra,
+        )
+        await _save_assistant(db, dialog, ack, "tz_update", now)
+        await log_event(db, "agent_response", "tz_update", dialog.id, {"preview": ack[:120]})
+        await db.flush()
+        return ReplyOutcome.reply(ack)
 
     # Fresh TZ handoff → admin. NEVER after price already given, NEVER on FAQ/side questions.
     if should_tz_ack_handoff(
@@ -682,16 +762,6 @@ async def _run_llm_pipeline(
         content=content,
         awaiting_admin=bool(dialog.awaiting_admin_quote),
     ):
-        # Never silently ignore TZ — always ack client, then hand off to admin
-        ack = ideal_tz_ack(
-            pointer=kind == MsgKind.SHORT_POINTER,
-            content=content,
-        )
-        # Prefer client_offer_pitch style opener if orch gave a pitch
-        pitch = (orch.get("client_offer_pitch") or "").strip()
-        if pitch and not pitch.lower().startswith(("клиент", "тз собрано")):
-            ack = f"{pitch.rstrip(' .,')}, цену скажу когда соберу оценку"
-
         await _activate_awaiting_admin(
             db,
             dialog,
@@ -702,6 +772,20 @@ async def _run_llm_pipeline(
             estimated_price_usd=_as_float(orch.get("estimated_price_usd")),
             estimated_days=_as_int(orch.get("estimated_days")),
             client_offer_pitch=(orch.get("client_offer_pitch") or None),
+        )
+        ack = await _compose_sales_reply(
+            content=content,
+            history_text=history_text,
+            rag_context=rag_context,
+            agent_settings=agent_settings,
+            orch=orch,
+            allow_prices=False,
+            extra_rules=(
+                "Это первое содержательное описание задачи, цены клиенту ещё нет. "
+                "В ответе обязана быть конкретная деталь из его текста (цифра, платформа или ограничение). "
+                "Можно один уточняющий вопрос и можно сказать что цену назовёшь после оценки. "
+                "Нельзя начинать с «тз вижу», «тз принял», «ок, учел» или «ок, докинул»."
+            ),
         )
         await _save_assistant(db, dialog, ack, "tz_ack", now)
         await log_event(db, "agent_response", "tz_ack", dialog.id, {"preview": ack[:120]})
@@ -859,6 +943,18 @@ async def _run_llm_pipeline(
             kind=kind,
             price_already=allow_prices,
         )
+        if not response or is_stock_reply(response):
+            response = await _compose_sales_reply(
+                content=content,
+                history_text=history_text,
+                rag_context=rag_context,
+                agent_settings=agent_settings,
+                orch=orch,
+                allow_prices=allow_prices,
+                extra_rules=(
+                    "Черновик ответа был пустым или штампом. Напиши заново по последнему сообщению клиента."
+                ),
+            )
     amount = dialog.quoted_price_usd or float(payment_data.get("amount_usdt") or 0)
     response = await expand_placeholders_in_text(response, amount=amount)
 
@@ -925,6 +1021,8 @@ def should_tz_ack_handoff(
         return False
     if is_deal_process_question(content) or is_price_request(content):
         return False
+    if is_short_question(content) and kind != MsgKind.LONG_TZ:
+        return False
     # Only on real TZ briefs — short «делаете ботов?» must NOT hand off
     if kind == MsgKind.LONG_TZ:
         return True
@@ -955,12 +1053,10 @@ def _empty_sales_fallback(
                 break
     if price_already:
         return deal_process_reply(has_quote=True)
+    # Empty means the caller must generate a contextual reply, not a stock ack.
     if has_tz:
-        return ideal_tz_ack(
-            pointer=kind == MsgKind.SHORT_POINTER,
-            content=content or (dialog.tz_summary or ""),
-        )
-    return "напишите что нужно - сделаем под задачу"
+        return ""
+    return ""
 
 
 def _as_int(v) -> int | None:
@@ -982,20 +1078,20 @@ async def _refresh_admin_summary(
     last_message: str,
     notify: bool,
 ) -> None:
-    summary = (orch.get("admin_task_summary") or "").strip()
-    if not summary:
-        snippet = (last_message or "").strip()[:500]
-        if snippet:
-            base = (dialog.admin_task_summary or dialog.tz_summary or "").strip()
-            summary = f"{base}\n{snippet}".strip() if base and snippet not in base else (base or snippet)
+    existing = (dialog.admin_task_summary or dialog.tz_summary or "").strip()
+    summary = merge_task_summary(existing, orch.get("admin_task_summary") or "", last_message)
     if not summary:
         return
+    # A side message must not replace the brief the admin and the offer are built from.
+    if summary == existing and not (orch.get("client_offer_pitch") or "").strip():
+        if not notify:
+            return
 
     dialog.admin_task_summary = summary[:2000]
     dialog.tz_summary = summary[:2000]
-    pitch = (orch.get("client_offer_pitch") or "").strip()
-    if pitch:
-        dialog.client_offer_pitch = pitch[:1000]
+    pitch = usable_client_pitch(orch.get("client_offer_pitch") or "")
+    if pitch and summary != existing:
+        dialog.client_offer_pitch = pitch
     est = _as_float(orch.get("estimated_price_usd"))
     days = _as_int(orch.get("estimated_days"))
     if est is not None:
@@ -1049,8 +1145,9 @@ async def _activate_awaiting_admin(
     dialog.work_status = WorkStatus.AWAITING_ADMIN.value
     dialog.admin_task_summary = summary
     dialog.tz_summary = summary
-    if client_offer_pitch:
-        dialog.client_offer_pitch = client_offer_pitch.strip()[:1000]
+    pitch = usable_client_pitch(client_offer_pitch or "")
+    if pitch:
+        dialog.client_offer_pitch = pitch
     dialog.followup_mode = FollowupMode.NONE.value
     dialog.next_followup_at = None
     if estimated_price_usd is not None:
@@ -1088,7 +1185,7 @@ async def _activate_awaiting_admin(
 
 
 async def _ensure_client_pitch(db: AsyncSession, dialog: Dialog) -> str:
-    pitch = (getattr(dialog, "client_offer_pitch", None) or "").strip()
+    pitch = usable_client_pitch(getattr(dialog, "client_offer_pitch", None) or "")
     if pitch and not re.search(r"(?i)клиент\s+запрос|тз\s+собрано|нужна\s+точн", pitch):
         return pitch
 
@@ -1107,7 +1204,7 @@ async def _ensure_client_pitch(db: AsyncSession, dialog: Dialog) -> str:
             temperature=0.4,
             prefer="gemini",
         )
-        pitch = (pitch or "").strip().strip('"')
+        pitch = usable_client_pitch((pitch or "").strip().strip('"'))
     except Exception:
         pitch = ""
     if not pitch:
